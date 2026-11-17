@@ -1,0 +1,20 @@
+__pycache__/
+.pytest_cache/
+.venv/
+node_modules/
+test-results/
+playwright-report/
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Local operational data and generated archives must stay out of Git.
+data/*
+!data/.gitkeep
+*.db
+*.sqlite
+*.sqlite3
+COT_BACKUP_*.json
+COT_ARCHIVIO_*.json
+*.csv

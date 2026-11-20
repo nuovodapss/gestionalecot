@@ -13,7 +13,7 @@ module.exports = defineConfig({
     },
   },
   webServer: {
-    command: 'COT_SQLITE_PATH=/tmp/cot-r8-playwright.sqlite3 .venv/bin/python -m streamlit run app.py --server.headless true --server.port 8510',
+    command: '.venv/bin/python -m streamlit run app.py --server.headless true --server.port 8510',
     url: 'http://127.0.0.1:8510/_stcore/health',
     reuseExistingServer: !process.env.CI,
     timeout: 60_000,

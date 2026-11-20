@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="it">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Diagnostica componente Streamlit v1</title>
+<style>
+  body{font:16px system-ui,sans-serif;margin:16px;color:#17211b}
+  button{font:inherit;padding:8px 12px}
+  #state{margin-top:12px;padding:10px;background:#eef5ff}
+</style>
+<p id="label">Componente v1 diagnostico caricato.</p>
+<button id="probe" type="button">Invia prova a Python</button>
+<div id="state" role="status" aria-live="polite">Handshake in attesa.</div>
+<script>
+(() => {
+  'use strict';
+  let ready = false;
+  let rendered = false;
+  let pendingRequestId = null;
+  const state = document.getElementById('state');
+  const send = (kind, requestId) => {
+    if (!ready || window.parent === window) return false;
+    window.parent.postMessage({isStreamlitMessage:true,type:'streamlit:setComponentValue',
+      dataType:'json',value:{kind,request_id:requestId,event_id:`${kind}-${Date.now()}`}},window.location.origin);
+    return true;
+  };
+  const setHeight = () => {
+    if (ready) window.parent.postMessage({isStreamlitMessage:true,type:'streamlit:setFrameHeight',
+      height:document.documentElement.scrollHeight},window.location.origin);
+  };
+  window.addEventListener('message', event => {
+    if (event.source !== window.parent || event.origin !== window.location.origin
+        || event.data?.type !== 'streamlit:render') return;
+    rendered = true;
+    const ack = event.data.args?.ack;
+    if (ack?.kind === 'probe' && ack.request_id === pendingRequestId && ack.ok) {
+      state.textContent = 'Conferma Python ricevuta; invio prova di ritorno.';
+      send('probe_ack', pendingRequestId);
+    } else if (ack?.kind === 'probe_ack' && ack.request_id === pendingRequestId && ack.confirmed) {
+      state.textContent = 'Handshake JavaScript ↔ Python verificato.';
+      pendingRequestId = null;
+    }
+    setHeight();
+  });
+  document.getElementById('probe').addEventListener('click', () => {
+    if (!rendered) { state.textContent = 'Streamlit non ha ancora inviato render.'; return; }
+    pendingRequestId = `diag-${Date.now()}`;
+    state.textContent = 'Invio JavaScript → Python…';
+    send('probe', pendingRequestId);
+  });
+  const announce = () => {
+    if (ready || window.parent === window) return;
+    ready = true;
+    window.parent.postMessage({isStreamlitMessage:true,type:'streamlit:componentReady',apiVersion:1},window.location.origin);
+  };
+  if (document.readyState === 'complete') announce();
+  else window.addEventListener('load', announce, {once:true});
+})();
+</script>
+</html>

@@ -64,6 +64,8 @@ class StoreTests(unittest.TestCase):
         original=(root/'R8_ORIGINALE_IMMUTATO.html').read_bytes()
         augmented=(root/'index.html').read_bytes()
         self.assertEqual(augmented.replace(b'<script src="cot_streamlit_bridge.js"></script>\n',b''),original)
+        self.assertIn(b"askPassword('open'",original)
+        self.assertIn(b"db=await decryptArchive(env,p)",original)
         for screen in (b'Coda COT',b'OdC oggi',b'Lista OdC',b'Hospice',b'Strutture',b'Cruscotto',b'Qualit',b'Dati & backup'):
             self.assertIn(screen, original)
 
@@ -73,6 +75,31 @@ class StoreTests(unittest.TestCase):
         self.assertIn("components.declare_component('cot_r8_full_parity', path=str(FRONTEND))",app)
         self.assertIn("FRONTEND = ROOT / 'frontend'",app)
         self.assertIn("layout='wide'",app)
+        self.assertIn('from relational_session import import_archive',app)
+        self.assertNotIn('SqliteEncryptedStore',app)
+
+    def test_streamlit_bridge_uses_registered_v1_messages_and_frame_lifecycle(self):
+        root=Path(__file__).resolve().parents[1]
+        bridge=(root/'frontend'/'cot_streamlit_bridge.js').read_text()
+        protocol=(root/'streamlit_bridge.py').read_text()
+        self.assertIn("type:'streamlit:componentReady',apiVersion:1",bridge)
+        self.assertIn("post('streamlit:setComponentValue'",bridge)
+        self.assertIn("post('streamlit:setFrameHeight'",bridge)
+        self.assertIn("event.source!==window.parent",bridge)
+        self.assertIn("event.origin!==window.location.origin",bridge)
+        self.assertIn("window.addEventListener('pagehide'",bridge)
+        self.assertNotIn('readyAttempts',bridge)
+        self.assertNotIn('sendHeight()',bridge)
+        self.assertNotIn('serverRevision',bridge)
+        self.assertIn('function openRelationalArchive(payload)',bridge)
+        self.assertIn("Archivio relazionale non cifrato",bridge)
+        self.assertIn("sendValue({kind:'probe_ack'",bridge)
+        self.assertIn('function setFrameHeight()',bridge)
+        self.assertIn('function openRelationalArchive(payload)',bridge)
+        self.assertIn('const nextDb=migrateDb(JSON.parse(JSON.stringify(payload)))',bridge)
+        self.assertIn("StreamlitV1.setFrameHeight(Math.max(850",bridge)
+        self.assertIn('if kind == "probe":',protocol)
+        self.assertIn('if kind == "loaded":',protocol)
 
     def test_private_local_data_is_ignored_by_git(self):
         root=Path(__file__).resolve().parents[1]

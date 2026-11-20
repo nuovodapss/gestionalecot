@@ -1,157 +1,249 @@
 /*
- * COT R8 -> Streamlit parity adapter (experimental).
- * This add-on does not replace, remove or rewrite R8's views and forms.
- * Browser encrypts snapshots with the existing R8 crypto; only the encrypted
- * envelope is transported to the Streamlit Python backend.
- * Not approved for processing real patient data on Community Cloud.
+ * R8 ↔ Streamlit Components v1 adapter.
+ * The page remains an isolated, registered Streamlit custom component because
+ * R8 is a full standalone app with a large global DOM and CSS surface.
+ * Streamlit 1.51.0 v1 message protocol: componentReady, render,
+ * setComponentValue, and setFrameHeight. No SQLite autosave is used.
  */
 (function () {
   'use strict';
-  let serverRevision = 0;
-  let serverEnvelope = null;
-  let serverAck = null;
-  let pending = null;
+  let disposed = false;
+  let streamlitReady = false;
+  let renderedByStreamlit = false;
   let pendingTimer = null;
-  let serverAvailable = false;
-  let readyTimer = null;
-  let readyAttempts = 0;
-  let backendStatus = 'Non connesso';
+  let frameHeightScheduled = false;
+  let pendingRequestId = null;
+  let lastCommandId = null;
+  let deferredSessionState = null;
+  let bridgeStatus = 'In attesa del bridge';
+  let relationalMode = false;
   const R8_ACTIVE = new Set(['In attesa', 'Nessun riscontro']);
   const R8_ACCEPTED = 'Accettato';
   const ACTIVE_STATUSES = new Set([...R8_ACTIVE, R8_ACCEPTED]);
-  let lastAckId = null;
-  let restoringFromServer = false;
-
   const id = x => document.getElementById(x);
-  const post = (type, extra={}) => window.parent.postMessage({isStreamlitMessage: true, type, ...extra}, '*');
-  const sendValue = value => post('streamlit:setComponentValue', {value, dataType:'json'});
-  const sendHeight = () => {
-    if(!serverAvailable)return;
-    post('streamlit:setFrameHeight', {height:Math.max(850,document.documentElement.scrollHeight,document.body.scrollHeight)});
-  };
   const newId = () => 'cot-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2,10);
-
-  function renderBridgeStatus() {
+  const post = (type, extra={}) => {
+    if (disposed || window.parent === window || !streamlitReady) return false;
+    window.parent.postMessage({isStreamlitMessage:true,type,...extra}, window.location.origin);
+    return true;
+  };
+  // Names mirror the documented Components v1 frontend helpers.
+  const StreamlitV1 = {
+    setComponentReady: () => {
+      if (disposed || streamlitReady || window.parent === window) return;
+      streamlitReady = true;
+      window.parent.postMessage({isStreamlitMessage:true,type:'streamlit:componentReady',apiVersion:1},window.location.origin);
+    },
+    setComponentValue: value => post('streamlit:setComponentValue',{value,dataType:'json'}),
+    setFrameHeight: height => post('streamlit:setFrameHeight',{height}),
+  };
+  const sendValue = value => StreamlitV1.setComponentValue(value);
+  function renderBridgeStatus(text) {
+    if (text) bridgeStatus = text;
     let badge=id('r8StreamlitSync');
     if(!badge) {
       badge=document.createElement('span');
       badge.id='r8StreamlitSync';badge.className='security-state locked';
-      badge.style.cssText='max-width:220px;white-space:normal;line-height:1.3';
+      badge.style.cssText='max-width:260px;white-space:normal;line-height:1.3';
       document.querySelector('.topbar .actions')?.prepend(badge);
     }
-    if(badge){badge.textContent='● Streamlit: '+backendStatus;badge.title='Sincronizzazione del backup CIFRATO sul database del server (solo prototipo)';
-      badge.style.color=/Errore|Conflitto|Non connesso/.test(backendStatus)?'#b42318':'#08752f';}
+    if(badge){badge.textContent='● Streamlit: '+bridgeStatus;
+      badge.title='Sessione volatile; esporta un archivio relazionale prima di chiudere.';
+      badge.style.color=/Errore|non connesso|non riuscito/i.test(bridgeStatus)?'#b42318':'#08752f';}
   }
   function addRestoreButton() {
-    const gate=document.querySelector('#vaultGate .vault-actions');
-    if(!gate)return;
-    let demo=id('cotNewDemo');
-    if(!demo){demo=document.createElement('button');demo.id='cotNewDemo';demo.type='button';demo.className='btn';demo.textContent='Crea archivio di prova';demo.title='Solo dati sintetici: non usare per pazienti reali';gate.appendChild(demo);demo.addEventListener('click',async()=>{try{await createVault();queueSnapshot();}catch(e){if(e?.message!=='annullato')toast(e?.message||'Impossibile creare demo');}});}
-    demo.hidden=!!vaultOpen;
-    let btn=id('restoreStreamlit');
-    if(!btn){btn=document.createElement('button');btn.className='btn';btn.type='button';btn.id='restoreStreamlit';btn.textContent='Ripristina ultima sessione';gate.appendChild(btn);btn.addEventListener('click',restoreFromBackend);}
-    btn.hidden=!serverEnvelope || !!vaultOpen;
-    const gateTitle=document.querySelector('#r7GateTitle');if(gateTitle)gateTitle.textContent='Gestione COT';
+    const gateTitle=document.querySelector('#r7GateTitle');
+    if(gateTitle)gateTitle.textContent='Gestione COT';
   }
-  async function restoreFromBackend() {
-    if(!serverEnvelope)return;
-    if(vaultOpen && dirty && !confirm('Esistono modifiche in memoria. Sostituire la sessione con quella salvata sul server?'))return;
-    try {
-      let env=JSON.parse(serverEnvelope);
-      const file=new File([JSON.stringify(env)],'COT_ultima_sessione.json',{type:'application/json'});
-      const previousOpen=openFile;
-      /* The original R8 opens the encrypted envelope with the operator's password. */
-      restoringFromServer=true;
-      try { await previousOpen(file); } finally { restoringFromServer=false; }
-      serverRevision=Number(window.__cotStreamlitLatestRevision||serverRevision);
-      backendStatus='Sessione ripristinata';renderBridgeStatus();addRestoreButton();
-    }catch(e){backendStatus='Errore ripristino';renderBridgeStatus();toast(e?.message||'Ripristino non riuscito');}
+  function setRelationalMode(enabled) {
+    relationalMode=enabled;
+    const save=id('saveEncrypted');
+    let note=id('r8RelationalSaveNotice');
+    if(save)save.disabled=enabled;
+    if(enabled && save && !note) {
+      note=document.createElement('span');
+      note.id='r8RelationalSaveNotice';
+      note.className='small muted';
+      note.textContent='Archivio relazionale: usa “Prepara export” nel pannello Streamlit.';
+      save.insertAdjacentElement('afterend',note);
+    } else if(!enabled && note) note.remove();
+    if(enabled)r8SetState('LOADED','Archivio relazionale non cifrato caricato in memoria; esporta il file prima di chiudere.');
   }
   function queueSnapshot() {
-    if(!vaultOpen || !sessionPassword || !serverAvailable)return;
-    if(pendingTimer)clearTimeout(pendingTimer);
-    pendingTimer=setTimeout(sendEncryptedSnapshot,1800);
+    if (pendingTimer) clearTimeout(pendingTimer);
+    if (disposed) return;
+    pendingTimer=setTimeout(()=>{
+      pendingTimer=null;
+      const event={kind:'session_state',event_id:newId(),open:!!vaultOpen,dirty:!!dirty,generation:Number(r8Generation||0)};
+      if(!sendValue(event)) deferredSessionState=event;
+    },180);
   }
-  async function sendEncryptedSnapshot() {
-    pendingTimer=null;
-    if(pending || !vaultOpen || !sessionPassword || !serverAvailable)return;
-    let snapshot=null;
-    const generation=r8Generation;
-    try{
-      backendStatus='Cifratura in corso';renderBridgeStatus();
-      const io=r8PersistenceIO();
-      snapshot=await io.createSnapshot();
-      const env=await io.encryptSnapshot(snapshot);
-      const envelope=JSON.stringify(env);
-      /* Preserve multi-operator conflicts instead of overwriting silently. */
-      const message={kind:'encrypted_snapshot',request_id:newId(),expected_revision:serverRevision,
-        generation, envelope};
-      pending=message;
-      backendStatus='Salvataggio in corso';renderBridgeStatus();
-      sendValue(message);
-    }catch(e){backendStatus='Errore cifratura';renderBridgeStatus();console.error('COT sync',e);}
-    finally {if(snapshot) snapshot.canonical='';}
+  function setFrameHeight() {
+    StreamlitV1.setFrameHeight(Math.max(850,document.documentElement.scrollHeight,document.body.scrollHeight));
   }
-  function readRenderArgs(event) {
-    if(!event?.data?.isStreamlitMessage || event.data.type!=='streamlit:render')return;
-    serverAvailable=true;
-    if(readyTimer){clearTimeout(readyTimer);readyTimer=null;}
-    const args=event.data.args||{};
-    const seenRevision=Number(args.revision||0);
-    window.__cotStreamlitLatestRevision=seenRevision;
-    if(typeof args.envelope==='string' && args.envelope)serverEnvelope=args.envelope;
-    if(seenRevision===0 && !pending)serverEnvelope=null;
-    const ack=args.ack;
-    if(pending && ack && ack.request_id===pending.request_id && lastAckId!==ack.request_id){
-      lastAckId=ack.request_id;
-      const m=pending;pending=null;
-      if(ack.ok){
-        serverRevision=Number(ack.revision);
-        backendStatus='Salvato sul server';
-        /* The R8 local "dirty" flag also tracks the manual file backup. */
-        if(r8Generation!==m.generation)queueSnapshot();
-      }else{
-        backendStatus='Conflitto o errore di salvataggio';
-        console.warn('COT: snapshot non salvato:',ack.error);
-        toast('Sincronizzazione bloccata: '+String(ack.error||'verificare versione server'));
-      }
-    }else if(!vaultOpen && !pending){
-      serverRevision=seenRevision;
-      backendStatus=seenRevision?'Backup disponibile':'Connessione pronta';
-    } else if(!pending && seenRevision>serverRevision){
-      /* A different workstation wrote a new revision. Do not auto-overwrite. */
-      backendStatus='Conflitto: archivio aggiornato altrove';
+  function sendPayload(requestId) {
+    if (!vaultOpen || !db || !renderedByStreamlit) {
+      sendValue({kind:'bridge_error',event_id:newId(),request_id:requestId,command_kind:'export_payload',error:'Archivio R8 non aperto o bridge non pronto'});
+      return;
     }
-    renderBridgeStatus();addRestoreButton();sendHeight();
+    try {
+      const payload=JSON.parse(JSON.stringify(db));
+      pendingRequestId=requestId;
+      renderBridgeStatus('Invio snapshot R8 a Python');
+      sendValue({kind:'r8_payload',event_id:newId(),request_id:requestId,payload});
+    } catch(error) {
+      sendValue({kind:'bridge_error',event_id:newId(),request_id:requestId,error:String(error?.message||error)});
+    }
+  }
+  function openRelationalArchive(payload) {
+    const issue=typeof cotV32RecordError==='function'?cotV32RecordError(payload):'Validatore R8 V3.2 non disponibile';
+    if(issue) throw new Error(issue);
+    const nextDb=migrateDb(JSON.parse(JSON.stringify(payload)));
+    const save=id('saveEncrypted');
+    const previous={db,vaultOpen,sessionPassword,dirty,protocol:r7SessionProtocol,generation:r8Generation,
+      state:r8State,message:r8StateMessage,relationalMode,saveTitle:save?.title};
+    try {
+      db=nextDb;
+      sessionPassword=null;
+      r7SessionProtocol='RELATIONAL';
+      dirty=false;
+      r8Generation=Number(r8Generation||0)+1;
+      initControls();
+      refreshAll();
+      setRelationalMode(true);
+      setVault(true);
+      if(id('saveEncrypted')) id('saveEncrypted').title='Archivio relazionale non cifrato: prepara export nel pannello Streamlit.';
+      r8SetState('LOADED','Archivio relazionale non cifrato. I dati sono temporanei e restano in memoria.');
+      r7ClearSaveNotice?.();
+    } catch(error) {
+      db=previous.db;sessionPassword=previous.sessionPassword;dirty=previous.dirty;
+      r7SessionProtocol=previous.protocol;r8Generation=previous.generation;
+      relationalMode=previous.relationalMode;r8State=previous.state;r8StateMessage=previous.message;
+      if(save)save.title=previous.saveTitle||'';
+      setRelationalMode(previous.relationalMode);setVault(previous.vaultOpen);
+      try { initControls();refreshAll();r8UpdateIndicator(); } catch(restoreError) {}
+      throw error;
+    }
+  }
+  function loadRelationalPayload(args) {
+    if(vaultOpen && dirty && !confirm('Le modifiche R8 correnti non sono ancora esportate. Sostituire la sessione?')) {
+      sendValue({kind:'bridge_error',event_id:newId(),request_id:args.id,command_kind:'load_payload',error:'Caricamento annullato per proteggere le modifiche non esportate'});
+      return;
+    }
+    pendingRequestId=args.id;
+    openRelationalArchive(args.payload);
+    renderBridgeStatus('Archivio relazionale non cifrato aperto');
+    toast('Archivio relazionale validato e aperto · dati non cifrati');
+    sendValue({kind:'loaded',event_id:newId(),request_id:args.id});
+    queueSnapshot();
+  }
+  function handleCommand(command) {
+    if(!command || typeof command.id!=='string' || command.id===lastCommandId)return;
+    lastCommandId=command.id;
+    try {
+      if(command.kind==='probe') {
+        pendingRequestId=command.request_id;
+        bridgeStatus='Prova JavaScript → Python in invio';renderBridgeStatus();
+        sendValue({kind:'probe',event_id:newId(),request_id:command.request_id,local_counter:Number(window.__cotBridgeLocalCounter||0)});
+      } else if(command.kind==='load_payload') {
+        loadRelationalPayload(command);
+      } else if(command.kind==='export_payload') {
+        sendPayload(command.request_id);
+      }
+    } catch(error) {
+      renderBridgeStatus('Errore di caricamento');
+      sendValue({kind:'bridge_error',event_id:newId(),request_id:command.request_id,command_kind:command.kind,error:String(error?.message||error)});
+    }
+  }
+  const openEncryptedArchive=window.openFile;
+  window.openFile=async function(file) {
+    await openEncryptedArchive(file);
+    setRelationalMode(false);
+  };
+  const closeArchive=window.lockArchive;
+  window.lockArchive=function(...args) {
+    const result=closeArchive(...args);
+    if(!vaultOpen)setRelationalMode(false);
+    return result;
+  };
+  function readRenderArgs(event) {
+    if(disposed || event.source!==window.parent || event.origin!==window.location.origin
+        || !event.data?.isStreamlitMessage || event.data.type!=='streamlit:render') return;
+    renderedByStreamlit=true;
+    const args=event.data.args||{};
+    const ack=args.ack;
+    if(ack && pendingRequestId && ack.request_id===pendingRequestId) {
+      pendingRequestId=null;
+      if(ack.ok) {
+        if(ack.loaded) renderBridgeStatus('Archivio relazionale caricato');
+        else if(ack.filename) renderBridgeStatus('Archivio verificato; download pronto');
+        else renderBridgeStatus('Bridge bidirezionale confermato');
+        if(ack.filename && relationalMode) {
+          dirty=false;
+          r8SetState('EXPORTED','Archivio relazionale verificato; download disponibile nel pannello Streamlit.');
+        }
+        window.__cotBridgeLocalCounter=Number(window.__cotBridgeLocalCounter||0)+1;
+        if(ack.kind==='probe') sendValue({kind:'probe_ack',event_id:newId(),request_id:ack.request_id,
+          local_counter:Number(window.__cotBridgeLocalCounter)});
+      } else {
+        renderBridgeStatus('Errore: esportazione/verifica non riuscita');
+      }
+    }
+    handleCommand(args.command);
+    if(deferredSessionState && !args.command) {
+      const eventValue=deferredSessionState;
+      if(sendValue(eventValue)) deferredSessionState=null;
+    }
+    if(!args.command && !pendingRequestId && !deferredSessionState && !window.__cotInitialStateSent) {
+      window.__cotInitialStateSent=true;
+      queueSnapshot();
+    }
+    setFrameHeight();
   }
   window.addEventListener('message',readRenderArgs);
   const announceReady=()=>{
-    if(serverAvailable||readyAttempts>=40)return;
-    post('streamlit:componentReady',{apiVersion:1});
-    readyAttempts++;
-    readyTimer=setTimeout(announceReady,250);
+    if(disposed || streamlitReady)return;
+    requestAnimationFrame(()=>StreamlitV1.setComponentReady());
   };
-  if(document.readyState==='complete')setTimeout(announceReady,100);
-  else window.addEventListener('load',()=>setTimeout(announceReady,100),{once:true});
-  const frameTick=()=>setTimeout(sendHeight,100);
-  window.addEventListener('load',frameTick);
-  window.addEventListener('resize',frameTick);
-  try {new ResizeObserver(frameTick).observe(document.body);}catch(e){}
+  if(document.readyState==='complete')announceReady();
+  else window.addEventListener('load',announceReady,{once:true});
+  const resize=()=>{
+    if(!renderedByStreamlit || disposed)return;
+    if(frameHeightScheduled)return;
+    frameHeightScheduled=true;
+    requestAnimationFrame(()=>{frameHeightScheduled=false;if(!disposed)setFrameHeight();});
+  };
+  window.addEventListener('resize',resize);
+  let resizeObserver=null;
+  try { resizeObserver=new ResizeObserver(resize);resizeObserver.observe(document.body); } catch(error) {}
+  window.addEventListener('pagehide',()=>{
+    disposed=true;
+    if(pendingTimer)clearTimeout(pendingTimer);
+    resizeObserver?.disconnect();
+    window.removeEventListener('message',readRenderArgs);
+    window.removeEventListener('resize',resize);
+  },{once:true});
 
   const priorDirty=setDirty;
-  setDirty=function(...args){const res=priorDirty(...args);queueSnapshot();return res;};
+  setDirty=function(...args){const res=priorDirty(...args);if(relationalMode)r8SetState('DIRTY','Modifiche non esportate; prepara un nuovo archivio.');queueSnapshot();return res;};
   const priorVault=setVault;
-  setVault=function(...args){const r=priorVault(...args);addRestoreButton();return r;};
+  setVault=function(...args){const r=priorVault(...args);addRestoreButton();queueSnapshot();return r;};
   const priorOpen=openFile;
   openFile=async function(file){
-    if(serverEnvelope && !vaultOpen && !restoringFromServer && !confirm('Esiste già un backup sul server. Aprire un altro JSON lo sostituirà al prossimo aggiornamento. Continuare?'))return;
     await priorOpen(file);
-    serverRevision=Number(window.__cotStreamlitLatestRevision||serverRevision);
+    setRelationalMode(false);
     addRestoreButton();
     queueSnapshot();
   };
+  const priorCreate=createVault;
+  createVault=async function(...args){
+    const result=await priorCreate(...args);
+    setRelationalMode(false);
+    queueSnapshot();
+    return result;
+  };
   const priorClose=lockArchive;
-  lockArchive=function(...args){const r=priorClose(...args);addRestoreButton();return r;};
+  lockArchive=function(...args){const r=priorClose(...args);queueSnapshot();return r;};
 
   /*
    * In R8, a dischargePathway is the boundary for competing facilities.
@@ -296,6 +388,7 @@
   refreshAll=function(...args){const r=priorRefresh(...args);if(vaultOpen){renderStructureView();renderWardView();}return r;};
 
   window.COT_STREAMLIT_BRIDGE_TEST={autoCloseContacts,queueSnapshot,renderStructureView,renderWardView,
-    getRevision:()=>serverRevision,getStatus:()=>backendStatus};
-  renderBridgeStatus();addRestoreButton();sendHeight();
+    getStatus:()=>bridgeStatus,getHandshake:()=>({ready:streamlitReady,rendered:renderedByStreamlit}),
+    getArchiveMode:()=>relationalMode?'RELATIONAL':'R8'};
+  renderBridgeStatus();addRestoreButton();
 })();
